@@ -1,0 +1,25 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Playwright persistent profile (contains login/session)
+google_profile/
+
+# Generated data files
+questions_snapshot.json
+
+# Local runtime data (usually personal/sensitive)
