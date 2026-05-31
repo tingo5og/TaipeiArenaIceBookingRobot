@@ -1,18 +1,32 @@
 import asyncio
 import csv
 import json
+import os
+import random
 import re
+import sys
 import time
 import traceback
 from pathlib import Path
 
 from playwright.async_api import Locator, Page, async_playwright
 
-USER_DATA_DIR = "./google_profile"
+def get_base_dir() -> Path:
+    from_env = os.environ.get("BOOKING_BASE_DIR", "").strip()
+    if from_env:
+        return Path(from_env).resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = get_base_dir()
+
+USER_DATA_DIR = str(BASE_DIR / "google_profile")
 FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSchP7dRjEOyofx3V6cu7do8UM_WghZRuB9QnwMwQAvceZ2evg/viewform?pli=1&pli=1"
-SELECTIONS_FILE = Path("./selections.json")
-QUESTIONS_SNAPSHOT_FILE = Path("./questions_snapshot.json")
-COURSE_CSV_FILE = Path("./courses_schedule.csv")
+SELECTIONS_FILE = BASE_DIR / "selections.json"
+QUESTIONS_SNAPSHOT_FILE = BASE_DIR / "questions_snapshot.json"
+COURSE_CSV_FILE = BASE_DIR / "courses_schedule.csv"
 PAUSE_ON_STALL = True
 AUTO_UPDATE_SELECTIONS = False
 DRY_RUN = False  # True 時會走到提交按鈕但不真正點擊,用於測試流程和檢查填寫內容。
@@ -28,10 +42,111 @@ COURSE_TIME_LABELS = {
     "冰球進階班",
 }
 
+CONFIRM_MODE = os.environ.get("BOOKING_CONFIRM_MODE", "once").strip().lower()
+CONFIRM_MODE_ONCE = "once"
+CONFIRM_MODE_EVERY = "every"
+CONFIRM_MODE_NONE = "none"
+_ONCE_CONFIRMED = False
+SUBMIT_DELAY_RANGE = os.environ.get("BOOKING_SUBMIT_DELAY_RANGE", "0-1").strip()
+ANTIBOT_JITTER_ENABLED = os.environ.get("BOOKING_ANTIBOT_JITTER", "0").strip() == "1"
+
 
 def log(step: str, message: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [{step}] {message}")
+
+
+def get_submit_delay_seconds() -> float:
+    if SUBMIT_DELAY_RANGE == "5-10":
+        return random.uniform(5, 10)
+    if SUBMIT_DELAY_RANGE == "30-60":
+        return random.uniform(30, 60)
+    if SUBMIT_DELAY_RANGE == "60-120":
+        return random.uniform(60, 120)
+    return random.uniform(0, 1)
+
+
+async def delay_before_submit_if_needed() -> None:
+    seconds = get_submit_delay_seconds()
+    log("DELAY", f"Submit 前延遲 {seconds:.2f} 秒")
+    await asyncio.sleep(seconds)
+
+
+def get_antibot_jitter_seconds() -> float:
+    # 基準：每頁送出前 1-3 秒。
+    low, high = 1.0, 3.0
+
+    # 若 Submit 延遲選到 30 秒以上，對應拉長每頁等待，讓節奏更像人工操作。
+    if SUBMIT_DELAY_RANGE == "30-60":
+        low, high = 3.0, 6.0
+    elif SUBMIT_DELAY_RANGE == "60-120":
+        low, high = 6.0, 12.0
+
+    return random.uniform(low, high)
+
+
+async def delay_before_page_action_if_needed() -> None:
+    if not ANTIBOT_JITTER_ENABLED:
+        return
+    seconds = get_antibot_jitter_seconds()
+    log("JITTER", f"頁面送出前隨機等待 {seconds:.2f} 秒")
+    await asyncio.sleep(seconds)
+
+
+def should_confirm_before_submit() -> bool:
+    if CONFIRM_MODE == CONFIRM_MODE_NONE:
+        return False
+    if CONFIRM_MODE == CONFIRM_MODE_EVERY:
+        return True
+    # 預設 once
+    return not _ONCE_CONFIRMED
+
+
+def build_submit_confirmation_text(selections: dict) -> str:
+    fields = [
+        "請問您是新生還是舊生？",
+        "請問您的名字？(須與會員資料相同)",
+        "請問您的生日?",
+        "已了解以上說明內容",
+        "你的電子郵件",
+    ]
+
+    lines: list[str] = ["請確認本次送出資料：", "", "基本資料"]
+    for key in fields:
+        lines.append(f"- {key}: {str(selections.get(key, '')).strip()}")
+
+    lines.append("")
+    lines.append("這次執行課程名,時間")
+
+    combo = selections.get(COURSE_COMBO_KEY)
+    if isinstance(combo, list) and len(combo) >= 2:
+        course_name = str(combo[0]).strip()
+        time_slot = str(combo[1]).strip()
+        lines.append(f"- {course_name},{time_slot}")
+    else:
+        lines.append("- (本次無課程批次資訊)")
+
+    return "\n".join(lines)
+
+
+def ask_submit_confirmation(selections: dict) -> bool:
+    text = build_submit_confirmation_text(selections)
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        confirmed = messagebox.askyesno("執行前確認", text, parent=root)
+        root.destroy()
+        return confirmed
+    except Exception as exc:
+        log("WARN", f"無法顯示圖形確認視窗，改用終端機確認: {exc}")
+        print(text)
+        choice = input("確認送出？輸入 y 繼續，其餘取消: ").strip().lower()
+        return choice == "y"
 
 
 
@@ -515,7 +630,8 @@ async def goto_form_and_wait_login(page: Page) -> None:
     log("NAV", f"目前頁面: {page.url}")
 
 
-async def click_next_or_submit(page: Page) -> str:
+async def click_next_or_submit(page: Page, selections: dict) -> str:
+    global _ONCE_CONFIRMED
     submit_patterns = re.compile(r"提交|送出|傳送|Submit", re.I)
     next_patterns = re.compile(r"下一步|下一頁|繼續|Next|Continue", re.I)
 
@@ -527,6 +643,16 @@ async def click_next_or_submit(page: Page) -> str:
         if DRY_RUN:
             log("ACTION", "DRY_RUN=True,已到提交前,不送出")
             return "dry_run_ready"
+
+        if should_confirm_before_submit():
+            confirmed = await asyncio.to_thread(ask_submit_confirmation, selections)
+            if not confirmed:
+                log("ACTION", "使用者在提交前取消")
+                return "aborted"
+            _ONCE_CONFIRMED = True
+
+        await delay_before_page_action_if_needed()
+        await delay_before_submit_if_needed()
         log("ACTION", "偵測到提交按鈕,準備點擊")
         try:
             await submit_btn.click(timeout=10000)
@@ -542,6 +668,7 @@ async def click_next_or_submit(page: Page) -> str:
     if await next_btn.count() > 0 and await next_btn.is_visible():
         log("ACTION", "偵測到下一步按鈕,準備點擊")
         try:
+            await delay_before_page_action_if_needed()
             await next_btn.click(timeout=10000)
             await page.wait_for_load_state("networkidle")
         except Exception as exc:
@@ -556,6 +683,16 @@ async def click_next_or_submit(page: Page) -> str:
         if DRY_RUN:
             log("ACTION", "DRY_RUN=True,已到提交前(fallback),不送出")
             return "dry_run_ready"
+
+        if should_confirm_before_submit():
+            confirmed = await asyncio.to_thread(ask_submit_confirmation, selections)
+            if not confirmed:
+                log("ACTION", "使用者在提交前取消")
+                return "aborted"
+            _ONCE_CONFIRMED = True
+
+        await delay_before_page_action_if_needed()
+        await delay_before_submit_if_needed()
         log("ACTION", "使用 fallback 提交按鈕")
         try:
             await submit_fallback.click(timeout=10000)
@@ -571,6 +708,7 @@ async def click_next_or_submit(page: Page) -> str:
     if await next_fallback.count() > 0 and await next_fallback.is_visible():
         log("ACTION", "使用 fallback 下一步按鈕")
         try:
+            await delay_before_page_action_if_needed()
             await next_fallback.click(timeout=10000)
             await page.wait_for_load_state("networkidle")
         except Exception as exc:
@@ -584,6 +722,16 @@ async def click_next_or_submit(page: Page) -> str:
         if DRY_RUN:
             log("ACTION", "DRY_RUN=True,已到提交前(文字 fallback),不送出")
             return "dry_run_ready"
+
+        if should_confirm_before_submit():
+            confirmed = await asyncio.to_thread(ask_submit_confirmation, selections)
+            if not confirmed:
+                log("ACTION", "使用者在提交前取消")
+                return "aborted"
+            _ONCE_CONFIRMED = True
+
+        await delay_before_page_action_if_needed()
+        await delay_before_submit_if_needed()
         log("ACTION", "使用文字 fallback 提交")
         try:
             await submit_text_fallback.click(timeout=10000)
@@ -659,7 +807,7 @@ async def fill_one_form(page: Page, selections: dict) -> str:
         for item in inspected:
             await fill_question(item, selections)
 
-        action = await click_next_or_submit(page)
+        action = await click_next_or_submit(page, selections)
         if action == "aborted":
             log("DONE", "使用者在驗證流程中選擇結束")
             return "aborted"

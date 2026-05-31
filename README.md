@@ -1,113 +1,139 @@
-# Google Form 批次填表工具
+# Google Form 批次填表工具（GUI + 自動化）
 
-此專案用於自動填寫 Google 表單，支援：
-- 先讀取表單題目並產生設定檔與課程時段 CSV
-- 以 CSV `狀態=V` 進行批次填寫
-- 每筆完成後自動把 CSV 狀態更新為 `D`
-- 提交後若遇到人機驗證（reCAPTCHA），自動暫停等待手動通過
+此專案用於自動填寫 Google 表單，提供 GUI 操作，不需要手打 CMD。
 
-## 檔案說明
+核心能力：
+- 讀取表單題目並同步產生設定檔
+- 用 `courses_schedule.csv` 進行批次送出
+- `V` 待送出、`D` 已完成（會自動更新）
+- 送出前可設定確認模式與延遲策略
+- 支援防機器人節奏（每頁隨機等待 + Submit 前隨機等待）
 
+## 主要檔案
+
+- `app.py`
+  - PySide6 GUI 主程式
+  - 提供「基本資料 / 選課清單 / 執行中心」
 - `login.py`
   - 讀取 Google Form 題目
-  - 輸出 `questions_snapshot.json`
-  - 建立/更新 `selections.json`
-  - 輸出 `courses_schedule.csv`
-
+  - 更新 `questions_snapshot.json`、`selections.json`、`courses_schedule.csv`
 - `do_table.py`
-  - 讀取 `selections.json` 與 `courses_schedule.csv`
-  - 自動填寫表單（可批次）
-  - 批次時會讀取 CSV 中 `狀態=V` 的列
-  - 每筆完成後將對應列狀態改為 `D`
-
+  - 依 `selections.json` + `courses_schedule.csv` 自動填表
+  - 讀取 `狀態=V` 的列，送出成功後改成 `D`
 - `selections.json`
-  - 一般題目的答案設定（姓名、生日、Email 等）
-
+  - 基本資料答案（姓名、生日、Email、電話等）
 - `courses_schedule.csv`
   - 欄位：`狀態,課程名,時間`
-  - 狀態規則：
-    - 空白：未排程
-    - `V`：待填寫
-    - `D`：已完成
+
+## 狀態規則
+
+- 空白：未排程
+- `V`：待送出
+- `D`：已完成
 
 ## 環境需求
 
+- Windows
 - Python 3.11+
-- Windows（目前使用情境）
-- Google 帳號可登入
+- 可登入 Google 帳號
 
 ## 安裝
 
-```bash
+建議直接執行：
+
+```bat
+0_install.bat
+```
+
+內容等同：
+
+```bat
 pip install playwright
+pip install pyside6
+pip install pyinstaller
 playwright install chromium
 ```
 
-## 使用流程
+## GUI 使用方式
 
-### 1) 先抓表單結構
+啟動：
 
-```bash
-python login.py
+```bat
+1_gui.bat
 ```
 
-執行後：
-- 若跳 Google 登入頁，請手動登入
-- 完成後回到程式繼續
-- 會產生/更新 `selections.json`、`questions_snapshot.json`、`courses_schedule.csv`
+### 選課清單頁
 
-### 2) 編輯答案與批次清單
+- `從網頁載入清單`：會執行 `login.py` 並自動關閉瀏覽器
+- 可勾選課程並儲存到 CSV
+- 支援篩選：
+  - 課程名勾選（可多選）
+  - 星期關鍵字勾選 `(一)~(日)`
 
-1. 開啟 `selections.json`，填好固定欄位（例如姓名、生日、電子郵件、電話）。
-2. 開啟 `courses_schedule.csv`，把想報名的時段狀態改成 `V`。
+### 執行中心頁
 
-### 3) 執行批次填寫
+- 只需按 `執行 do_table.py`
+- 可選「確認模式」：
+  - 第一次需要按確認之後全自動
+  - 每次都需要按確認
+  - 全自動執行
+- 可選「Submit 前隨機延遲」：
+  - 0-1 秒
+  - 5-10 秒
+  - 30-60 秒
+  - 60-120 秒
+- 可勾選 `隨機等防機器人認證`
+  - 每次點下一步/提交前增加隨機等待
+  - 若 Submit 延遲為 30 秒以上，等待區間會自動拉長
+- 顯示本次執行清單與即時狀態
+  - 待執行 / 執行中 / 已完成
 
-```bash
-python do_table.py
+## 送出前確認內容
+
+在送出按鈕前會跳確認（依模式），內容包含：
+- 請問您是新生還是舊生？
+- 請問您的名字？(須與會員資料相同)
+- 請問您的生日?
+- 已了解以上說明內容
+- 你的電子郵件
+- 本次課程名,時間
+
+## EXE 打包 (未完成)
+
+建立 EXE（onedir）：
+
+```bat
+4_build_exe.bat
 ```
 
-程式行為：
-- 逐筆處理 CSV 裡的 `V`
-- 成功送出（或 DRY_RUN 手動確認完成）後，該列自動改成 `D`
-- 若遇到人機驗證，會停下並提示你先手動通過
+輸出路徑：
+- `dist/TaipeiArenaIceBookingTool/`
 
-## 重要參數（`do_table.py`）
+## EXE 啟動時自動檢查
 
-- `DRY_RUN = False`
-  - `True`：到提交前停下，不自動按提交
-  - `False`：自動提交
+啟動時會檢查：
+- `playwright` 套件是否可用
+- Chromium 是否可用
 
-- `PAUSE_ON_STALL = True`
-  - 找不到下一步/提交或流程停滯時，暫停等待手動決策
+若缺少，會跳出提示並可選擇自動安裝。
 
-- `FORM_URL`
-  - 目標 Google Form 網址
+## EXE 讀寫檔案位置
 
-- `USER_DATA_DIR = "./google_profile"`
-  - 瀏覽器持久化資料夾，用來保留登入狀態
+已支援 EXE 模式下自動讀寫同資料夾檔案：
+- `selections.json`
+- `courses_schedule.csv`
+- `questions_snapshot.json`
+- `google_profile/`
 
-## 人機驗證處理
-
-提交後如果出現 reCAPTCHA 或「不是機器人」頁面：
-1. 程式會顯示偵測訊息並暫停。
-2. 你在瀏覽器手動完成驗證。
-3. 回到終端按 Enter 讓程式繼續。
-4. 輸入 `q` 可中止整個批次。
+也就是說，把 EXE 與上述檔案放在同一資料夾，就可直接運作。
 
 ## 常見問題
 
-- 沒讀到批次資料
-  - 檢查 `courses_schedule.csv` 是否有 `狀態=V` 的列。
+- 沒有可執行課程
+  - 檢查 `courses_schedule.csv` 是否有 `狀態=V`
 
 - 一直要求登入
-  - 確認 `google_profile` 目錄可寫入，並且沒有被清空。
+  - 確認 `google_profile/` 可寫入且未被清空
 
 - 時段對不到
-  - `courses_schedule.csv` 的 `時間` 欄位請直接使用表單原字串。
-
-## 建議操作
-
-1. 先用 `DRY_RUN=True` 測一次流程。
-2. 確認填寫正確後改回 `DRY_RUN=False` 正式提交。
-3. 每次批次前先確認 CSV 的 `V` 只有你要送出的項目。
+  - `時間` 欄位請直接使用表單原字串

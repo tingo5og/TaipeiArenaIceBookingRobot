@@ -1,16 +1,29 @@
 import asyncio
 import csv
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+def get_base_dir() -> Path:
+    from_env = os.environ.get("BOOKING_BASE_DIR", "").strip()
+    if from_env:
+        return Path(from_env).resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = get_base_dir()
+
 # 設定資料儲存路徑 (路徑可自訂)
-USER_DATA_DIR = "./google_profile"
+USER_DATA_DIR = str(BASE_DIR / "google_profile")
 google_form_url = "https://docs.google.com/forms/d/e/1FAIpQLSchP7dRjEOyofx3V6cu7do8UM_WghZRuB9QnwMwQAvceZ2evg/viewform?pli=1&pli=1"
-QUESTIONS_SNAPSHOT_FILE = Path("./questions_snapshot.json")
-COURSE_CSV_FILE = Path("./courses_schedule.csv")
+QUESTIONS_SNAPSHOT_FILE = BASE_DIR / "questions_snapshot.json"
+COURSE_CSV_FILE = BASE_DIR / "courses_schedule.csv"
 COURSE_TIME_KEY = "課程時間"
 COURSE_TIME_LABELS = ["滑冰基礎班", "花式初級班", "花式進階班", "冰球初級班", "冰球進階班"]
 
@@ -25,7 +38,7 @@ def is_email_like_label(text: str) -> bool:
 
 
 def load_selections() -> dict[str, str]:
-    selections_file = Path("./selections.json")
+    selections_file = BASE_DIR / "selections.json"
     if not selections_file.exists():
         return {}
     try:
@@ -223,7 +236,7 @@ async def detect_email_field_label(page) -> tuple[str | None, list[str]]:
     # 不使用固定預設鍵名，只回傳真實偵測結果。
     return None, normalized_candidates
 
-async def init_browser():
+async def init_browser(auto_close: bool = False):
     async with async_playwright() as p:
         # 開啟持久化上下文
         context = await p.chromium.launch_persistent_context(
@@ -272,15 +285,19 @@ async def init_browser():
         }
 
         save_json(QUESTIONS_SNAPSHOT_FILE, snapshot_data)
-        save_json(Path("./selections.json"), selections)
+        save_json(BASE_DIR / "selections.json", selections)
         csv_count = export_course_csv_from_questions(questions)
         print("已建立/更新 questions_snapshot.json 與 selections.json")
         print(f"已建立/更新 {COURSE_CSV_FILE.name}，共 {csv_count} 筆課程時間")
         print("selections 鍵名:", list(selections.keys()))
 
-        await asyncio.to_thread(input, "請檢查 JSON 後按 Enter 結束... ")
+        if auto_close:
+            print("已完成更新，將自動關閉瀏覽器。")
+        else:
+            await asyncio.to_thread(input, "請檢查 JSON 後按 Enter 結束... ")
         await context.close()
 
 # 第一次執行先執行這個來登入
 if __name__ == "__main__":
-    asyncio.run(init_browser())
+    auto_close_mode = "--auto-close" in sys.argv
+    asyncio.run(init_browser(auto_close=auto_close_mode))
