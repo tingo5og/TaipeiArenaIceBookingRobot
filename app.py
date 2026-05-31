@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -42,6 +43,12 @@ COURSE_CSV_FILE = BASE_DIR / "courses_schedule.csv"
 QUESTIONS_SNAPSHOT_FILE = BASE_DIR / "questions_snapshot.json"
 LOGIN_SCRIPT = BASE_DIR / "login.py"
 DO_TABLE_SCRIPT = BASE_DIR / "do_table.py"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+PLAYWRIGHT_BROWSERS_DIR = BASE_DIR / "ms-playwright"
+
+if IS_FROZEN:
+    # EXE 模式固定瀏覽器下載位置，避免指向 _internal/.local-browsers 後找不到檔案。
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
 
 
 def _run_python_module(args: list[str]) -> tuple[bool, str]:
@@ -75,6 +82,37 @@ def _run_python_module(args: list[str]) -> tuple[bool, str]:
     return False, last_output
 
 
+def _run_playwright_install_chromium() -> tuple[bool, str]:
+    """安裝 chromium。EXE 模式用 bundled driver；一般模式用 python -m playwright。"""
+    if not IS_FROZEN:
+        return _run_python_module(["playwright", "install", "chromium"])
+
+    node_path = BASE_DIR / "_internal" / "playwright" / "driver" / "node.exe"
+    cli_path = BASE_DIR / "_internal" / "playwright" / "driver" / "package" / "cli.js"
+    if not node_path.exists() or not cli_path.exists():
+        return False, "找不到 bundled playwright driver (node.exe 或 cli.js)。"
+
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
+
+    try:
+        result = subprocess.run(
+            [str(node_path), str(cli_path), "install", "chromium"],
+            cwd=str(BASE_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+    except Exception as exc:
+        return False, str(exc)
+
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0, output.strip()
+
+
 def _check_playwright_and_chromium() -> tuple[bool, bool, str]:
     """檢查 playwright 套件與 chromium 是否可用。"""
     try:
@@ -105,9 +143,11 @@ def ensure_runtime_dependencies() -> bool:
     if has_playwright and not has_chromium:
         missing.append("playwright chromium")
 
+    missing_lines = "\n- ".join(missing)
+
     message = (
         "啟動前檢查到缺少必要元件:\n"
-        f"- {'\n- '.join(missing)}\n\n"
+        f"- {missing_lines}\n\n"
         "是否要立即自動安裝？"
     )
     if detail:
@@ -124,6 +164,14 @@ def ensure_runtime_dependencies() -> bool:
         return False
 
     if not has_playwright:
+        if IS_FROZEN:
+            QMessageBox.critical(
+                None,
+                "環境檢查失敗",
+                "EXE 版本缺少 playwright 套件，請重新打包（需包含 playwright）。",
+            )
+            return False
+
         ok, output = _run_python_module(["pip", "install", "playwright"])
         if not ok:
             QMessageBox.critical(
@@ -134,7 +182,7 @@ def ensure_runtime_dependencies() -> bool:
             )
             return False
 
-    ok, output = _run_python_module(["playwright", "install", "chromium"])
+    ok, output = _run_playwright_install_chromium()
     if not ok:
         QMessageBox.critical(
             None,
