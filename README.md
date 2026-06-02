@@ -44,7 +44,7 @@
 建議直接執行：
 
 ```bat
-0_install.bat
+0_run.bat
 ```
 
 內容等同：
@@ -56,12 +56,18 @@ pip install pyinstaller
 playwright install chromium
 ```
 
+只安裝不啟動可執行：
+
+```bat
+1_install.bat
+```
+
 ## GUI 使用方式
 
 啟動：
 
 ```bat
-1_gui.bat
+2_gui.bat
 ```
 
 ### 選課清單頁
@@ -136,11 +142,7 @@ playwright install chromium
 
 ## EXE 打包 (未完成)
 
-建立 EXE（onedir）：
-
-```bat
-4_build_exe.bat
-```
+目前倉庫尚未提供 `4_build_exe.bat`。
 
 輸出路徑：
 - `dist/TaipeiArenaIceBookingTool/`
