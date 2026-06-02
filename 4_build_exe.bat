@@ -1,1 +1,0 @@
-pyinstaller app.py --name TaipeiArenaIceBookingTool --windowed --onedir --clean --noconfirm --collect-all playwright --add-data "login.py;." --add-data "do_table.py;." --add-data "selections.json;." --add-data "questions_snapshot.json;." --add-data "courses_schedule.csv;." --add-data "google_profile;google_profile"

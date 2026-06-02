@@ -6,6 +6,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt
 from PySide6.QtGui import QAction
@@ -45,6 +46,8 @@ LOGIN_SCRIPT = BASE_DIR / "login.py"
 DO_TABLE_SCRIPT = BASE_DIR / "do_table.py"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 PLAYWRIGHT_BROWSERS_DIR = BASE_DIR / "ms-playwright"
+GOOGLE_PROFILE_DIR = BASE_DIR / "google_profile"
+BOOKING_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSchP7dRjEOyofx3V6cu7do8UM_WghZRuB9QnwMwQAvceZ2evg/viewform?pli=1&pli=1"
 
 if IS_FROZEN:
     # EXE 模式固定瀏覽器下載位置，避免指向 _internal/.local-browsers 後找不到檔案。
@@ -129,6 +132,24 @@ def _check_playwright_and_chromium() -> tuple[bool, bool, str]:
             return True, False, f"找不到 chromium 執行檔: {chromium_path}"
     except Exception as exc:
         return True, False, f"檢查 chromium 失敗: {exc}"
+
+
+def _resolve_chromium_executable() -> tuple[Path | None, str]:
+    """取得 Playwright Chromium 執行檔路徑。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return None, f"無法匯入 playwright: {exc}"
+
+    try:
+        with sync_playwright() as p:
+            chromium_path = Path(p.chromium.executable_path)
+    except Exception as exc:
+        return None, f"無法取得 Chromium 路徑: {exc}"
+
+    if not chromium_path.exists():
+        return None, f"找不到 Chromium 執行檔: {chromium_path}"
+    return chromium_path, ""
 
 
 def ensure_runtime_dependencies() -> bool:
@@ -552,10 +573,11 @@ class CourseTab(QWidget):
         self.load_output_chunks = []
         process = QProcess(self)
         process.setProgram(sys.executable)
-        process.setArguments([str(LOGIN_SCRIPT), "--auto-close"])
+        process.setArguments(["-u", str(LOGIN_SCRIPT), "--auto-close"])
         process.setWorkingDirectory(str(BASE_DIR))
         env = QProcessEnvironment.systemEnvironment()
         env.insert("BOOKING_BASE_DIR", str(BASE_DIR))
+        env.insert("PYTHONUNBUFFERED", "1")
         process.setProcessEnvironment(env)
         process.setProcessChannelMode(QProcess.MergedChannels)
         process.readyReadStandardOutput.connect(self.on_load_from_web_output)
@@ -629,7 +651,7 @@ class CourseTab(QWidget):
             if item is not None:
                 item.setCheckState(Qt.Unchecked)
 
-    def save_data(self) -> None:
+    def save_data(self, show_message: bool = True) -> None:
         self.sync_visible_checks_to_rows()
 
         output_rows: list[CourseRow] = []
@@ -643,7 +665,8 @@ class CourseTab(QWidget):
                 writer.writerow([row.status, row.course_name, row.time_slot])
 
         self.status_label.setText("儲存完成")
-        QMessageBox.information(self, "完成", "courses_schedule.csv 已儲存")
+        if show_message:
+            QMessageBox.information(self, "完成", "courses_schedule.csv 已儲存")
 
 
 class RunTab(QWidget):
@@ -653,12 +676,13 @@ class RunTab(QWidget):
     DELAY_0_1 = "0-1秒"
     DELAY_5_10 = "5-10秒"
     DELAY_30_60 = "30-60秒"
-    DELAY_60_120 = "60-120秒"
+    DELAY_300_600 = "300-600秒"
 
     def __init__(self) -> None:
         super().__init__()
         self.process: QProcess | None = None
         self.current_script = ""
+        self.sync_course_data_before_run: Callable[[], None] | None = None
         self.execution_targets: list[tuple[str, str]] = []
         self.current_running_index: int = -1
         self.batch_progress_re = re.compile(r"\[BATCH\]\s*第\s*(\d+)\s*/\s*(\d+)\s*筆")
@@ -693,12 +717,15 @@ class RunTab(QWidget):
             self.DELAY_0_1,
             self.DELAY_5_10,
             self.DELAY_30_60,
-            self.DELAY_60_120,
+            self.DELAY_300_600,
         ])
         self.delay_mode_combo.setCurrentText(self.DELAY_0_1)
 
         self.antibot_jitter_checkbox = QCheckBox("隨機等防機器人認證")
-        self.antibot_jitter_checkbox.setChecked(False)
+        self.antibot_jitter_checkbox.setChecked(True)
+
+        self.btn_open_web = QPushButton("用 Chromium 開啟網頁")
+        self.btn_open_web.clicked.connect(self.open_booking_web_with_chromium)
 
         self.btn_run_do_table = QPushButton("執行 do_table.py")
         self.btn_run_do_table.clicked.connect(self.run_do_table)
@@ -718,6 +745,7 @@ class RunTab(QWidget):
         mode_row.addStretch()
 
         row = QHBoxLayout()
+        row.addWidget(self.btn_open_web)
         row.addWidget(self.btn_run_do_table)
         row.addWidget(self.btn_stop)
         row.addStretch()
@@ -747,6 +775,7 @@ class RunTab(QWidget):
         self.confirm_mode_combo.setEnabled(not running)
         self.delay_mode_combo.setEnabled(not running)
         self.antibot_jitter_checkbox.setEnabled(not running)
+        self.btn_open_web.setEnabled(not running)
         self.btn_run_do_table.setEnabled(not running)
         self.btn_stop.setEnabled(running)
 
@@ -764,8 +793,8 @@ class RunTab(QWidget):
             return "5-10"
         if mode == self.DELAY_30_60:
             return "30-60"
-        if mode == self.DELAY_60_120:
-            return "60-120"
+        if mode == self.DELAY_300_600:
+            return "300-600"
         return "0-1"
 
     def _read_pending_targets(self) -> list[tuple[str, str]]:
@@ -854,6 +883,13 @@ class RunTab(QWidget):
             QMessageBox.critical(self, "錯誤", "找不到 do_table.py")
             return
 
+        if self.sync_course_data_before_run is not None:
+            try:
+                self.sync_course_data_before_run()
+            except Exception as exc:
+                QMessageBox.critical(self, "錯誤", f"同步選課清單失敗: {exc}")
+                return
+
         self.build_execution_list()
 
         self.run_script(
@@ -864,6 +900,27 @@ class RunTab(QWidget):
                 "BOOKING_ANTIBOT_JITTER": "1" if self.antibot_jitter_checkbox.isChecked() else "0",
             },
         )
+
+    def open_booking_web_with_chromium(self) -> None:
+        chromium_path, detail = _resolve_chromium_executable()
+        if chromium_path is None:
+            QMessageBox.critical(self, "開啟失敗", f"無法取得 Chromium。\n\n{detail}")
+            return
+
+        try:
+            GOOGLE_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(
+                [
+                    str(chromium_path),
+                    f"--user-data-dir={GOOGLE_PROFILE_DIR}",
+                    "--profile-directory=Default",
+                    "--new-window",
+                    BOOKING_FORM_URL,
+                ],
+                cwd=str(BASE_DIR),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "開啟失敗", f"啟動 Chromium 失敗: {exc}")
 
     def run_script(self, script_path: Path, extra_env: dict[str, str] | None = None) -> None:
         if self.process is not None:
@@ -880,10 +937,11 @@ class RunTab(QWidget):
 
         process = QProcess(self)
         process.setProgram(sys.executable)
-        process.setArguments([str(script_path)])
+        process.setArguments(["-u", str(script_path)])
         process.setWorkingDirectory(str(BASE_DIR))
         env = QProcessEnvironment.systemEnvironment()
         env.insert("BOOKING_BASE_DIR", str(BASE_DIR))
+        env.insert("PYTHONUNBUFFERED", "1")
         if extra_env:
             for key, value in extra_env.items():
                 env.insert(str(key), str(value))
@@ -940,6 +998,7 @@ class MainWindow(QMainWindow):
         self.profile_tab = ProfileTab()
         self.course_tab = CourseTab()
         self.run_tab = RunTab()
+        self.run_tab.sync_course_data_before_run = lambda: self.course_tab.save_data(show_message=False)
 
         tabs.addTab(self.profile_tab, "基本資料")
         tabs.addTab(self.course_tab, "選課清單")

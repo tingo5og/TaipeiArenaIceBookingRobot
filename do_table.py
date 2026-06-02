@@ -49,6 +49,9 @@ CONFIRM_MODE_NONE = "none"
 _ONCE_CONFIRMED = False
 SUBMIT_DELAY_RANGE = os.environ.get("BOOKING_SUBMIT_DELAY_RANGE", "0-1").strip()
 ANTIBOT_JITTER_ENABLED = os.environ.get("BOOKING_ANTIBOT_JITTER", "0").strip() == "1"
+VERIFY_POLL_INTERVAL_SEC = float(os.environ.get("BOOKING_VERIFY_POLL_INTERVAL_SEC", "1.2"))
+VERIFY_CLEAR_STABLE_ROUNDS = int(os.environ.get("BOOKING_VERIFY_CLEAR_STABLE_ROUNDS", "2"))
+VERIFY_MAX_WAIT_SEC = int(os.environ.get("BOOKING_VERIFY_MAX_WAIT_SEC", "0"))
 
 
 def log(step: str, message: str) -> None:
@@ -61,6 +64,9 @@ def get_submit_delay_seconds() -> float:
         return random.uniform(5, 10)
     if SUBMIT_DELAY_RANGE == "30-60":
         return random.uniform(30, 60)
+    if SUBMIT_DELAY_RANGE == "300-600":
+        return random.uniform(300, 600)
+    # 舊值相容,避免舊環境變數仍使用 60-120。
     if SUBMIT_DELAY_RANGE == "60-120":
         return random.uniform(60, 120)
     return random.uniform(0, 1)
@@ -79,6 +85,8 @@ def get_antibot_jitter_seconds() -> float:
     # 若 Submit 延遲選到 30 秒以上，對應拉長每頁等待，讓節奏更像人工操作。
     if SUBMIT_DELAY_RANGE == "30-60":
         low, high = 3.0, 6.0
+    elif SUBMIT_DELAY_RANGE == "300-600":
+        low, high = 12.0, 20.0
     elif SUBMIT_DELAY_RANGE == "60-120":
         low, high = 6.0, 12.0
 
@@ -247,57 +255,97 @@ def page_signature(page: Page, items: list[dict[str, object]]) -> str:
     return f"{page.url}::{'|'.join(labels)}"
 
 
-async def is_robot_verification_page(page: Page) -> bool:
-    """偵測目前頁面是否為人機驗證流程。"""
+async def get_robot_verification_signals(page: Page) -> list[str]:
+    """蒐集人機驗證跡象,回傳命中的訊號清單。"""
+    signals: list[str] = []
+
     url = page.url.lower()
     if any(x in url for x in ["recaptcha", "captcha", "challenge", "sorry"]):
-        return True
+        signals.append(f"url={page.url}")
 
     body_text = (await page.locator("body").inner_text()).lower()
     keywords = [
         "i'm not a robot",
         "verify you are human",
-        "recaptcha",
         "不是機器人",
         "人機驗證",
         "驗證你不是",
+        "異常流量",
+        "unusual traffic",
     ]
-    if any(k in body_text for k in keywords):
-        return True
+    for keyword in keywords:
+        if keyword in body_text:
+            signals.append(f"keyword={keyword}")
+            break
 
-    # reCAPTCHA 常見 iframe / 元素。
-    if await page.locator('iframe[src*="recaptcha"], div.g-recaptcha, #recaptcha').count() > 0:
-        return True
+    # 一般 Google Form 頁面可能帶隱藏的 reCAPTCHA 資源，只有可見 challenge 元件才算。
+    visible_challenge_selectors = [
+        'iframe[src*="recaptcha/api2/anchor"]',
+        'iframe[src*="recaptcha/api2/bframe"]',
+        'iframe[title*="reCAPTCHA" i]',
+        'div.g-recaptcha',
+        '#recaptcha',
+        'span[aria-label*="robot" i]',
+        'span[aria-label*="不是機器人"]',
+        'div[role="checkbox"][aria-label*="robot" i]',
+        'div[role="checkbox"][aria-label*="不是機器人"]',
+    ]
+    for selector in visible_challenge_selectors:
+        locator = page.locator(selector)
+        count = await locator.count()
+        for idx in range(count):
+            try:
+                if await locator.nth(idx).is_visible():
+                    signals.append(f"visible={selector}")
+                    break
+            except Exception:
+                continue
 
-    return False
+    return signals
+
+
+async def is_robot_verification_page(page: Page) -> bool:
+    """偵測目前頁面是否為人機驗證流程。"""
+    return len(await get_robot_verification_signals(page)) > 0
 
 
 async def handle_robot_verification_if_needed(page: Page) -> str | None:
-    """若偵測到人機驗證則暫停等待使用者手動處理。"""
-    if not await is_robot_verification_page(page):
+    """若偵測到人機驗證則自動輪詢,完成後自動繼續。"""
+    signals = await get_robot_verification_signals(page)
+    if not signals:
         return None
 
-    log("VERIFY", "偵測到人機驗證，請手動完成後再繼續")
-    while True:
-        user_choice = await asyncio.to_thread(
-            input,
-            "請先手動完成人機驗證；完成後按 Enter 繼續檢查 (q 結束批次): ",
-        )
-        if user_choice.strip().lower() == "q":
-            return "aborted"
+    log("VERIFY", f"偵測到人機驗證,判斷依據: {'; '.join(signals)}")
+    log("VERIFY", "請在瀏覽器完成驗證,系統會自動檢查並繼續")
 
-        # 等頁面狀態穩定後再次檢查。
+    start = time.monotonic()
+    clear_rounds = 0
+    last_progress_log_at = -999.0
+
+    while True:
         try:
-            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded", timeout=2000)
         except Exception:
             pass
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(int(max(0.2, VERIFY_POLL_INTERVAL_SEC) * 1000))
 
-        if not await is_robot_verification_page(page):
-            log("VERIFY", "人機驗證已通過，繼續流程")
-            return "verified"
+        signals = await get_robot_verification_signals(page)
+        elapsed = time.monotonic() - start
 
-        log("VERIFY", "仍在驗證頁面，請完成驗證後再按 Enter")
+        if not signals:
+            clear_rounds += 1
+            if clear_rounds >= max(1, VERIFY_CLEAR_STABLE_ROUNDS):
+                log("VERIFY", "人機驗證已通過，繼續流程")
+                return "verified"
+        else:
+            clear_rounds = 0
+            if elapsed - last_progress_log_at >= 5:
+                log("VERIFY", f"仍在驗證流程中 ({elapsed:.0f} 秒),目前依據: {'; '.join(signals)}")
+                last_progress_log_at = elapsed
+
+        if VERIFY_MAX_WAIT_SEC > 0 and elapsed >= VERIFY_MAX_WAIT_SEC:
+            log("VERIFY", f"等待人機驗證逾時 ({VERIFY_MAX_WAIT_SEC} 秒),停止批次")
+            return "aborted"
 
 
 def load_batch_from_csv() -> list[tuple[list[str], int]] | None:
@@ -619,6 +667,144 @@ async def fill_question(item: dict[str, object], selections: dict[str, str]) -> 
         log("FILL", f"已選下拉: {label}")
 
 
+def resolve_actual_answer(item: dict[str, object], answer: str) -> str:
+    question_type = str(item.get("type", ""))
+    if question_type != "radio":
+        return answer
+
+    options_list = [str(o) for o in item.get("options", [])]
+    if options_list and answer not in options_list:
+        matched = fuzzy_match_option(answer, options_list)
+        if matched:
+            return matched
+    return answer
+
+
+def build_preferred_radio_indices(
+    inspected: list[dict[str, object]],
+    selections: dict[str, str],
+) -> dict[tuple[str, str, str], int]:
+    """同一 dedupe key 有多個單選群組時,優先挑選包含目標選項的群組。"""
+    preferred: dict[tuple[str, str, str], int] = {}
+    for idx, item in enumerate(inspected):
+        label = str(item.get("label", "")).strip()
+        question_type = str(item.get("type", "")).strip()
+        if question_type != "radio":
+            continue
+
+        matched_key = resolve_selection_key(selections, label) or label
+        answer = get_answer_for_label(selections, label).strip()
+        if not answer:
+            continue
+
+        dedupe_key = (matched_key, question_type, answer)
+        actual_answer = resolve_actual_answer(item, answer)
+        options_list = [str(o) for o in item.get("options", [])]
+        if actual_answer in options_list and dedupe_key not in preferred:
+            preferred[dedupe_key] = idx
+    return preferred
+
+
+async def fill_questions_for_current_page(inspected: list[dict[str, object]], selections: dict[str, str]) -> None:
+    preferred_radio_indices = build_preferred_radio_indices(inspected, selections)
+    filled_question_keys: set[tuple[str, str, str]] = set()
+
+    for idx, item in enumerate(inspected):
+        label = str(item.get("label", "")).strip()
+        question_type = str(item.get("type", "")).strip()
+        matched_key = resolve_selection_key(selections, label) or label
+        answer = get_answer_for_label(selections, label).strip()
+        dedupe_key = (matched_key, question_type, answer)
+
+        if answer:
+            if dedupe_key in filled_question_keys:
+                log("FILL", f"略過重複題目: {label} -> {matched_key}")
+                continue
+
+            if question_type == "radio":
+                preferred_idx = preferred_radio_indices.get(dedupe_key)
+                if preferred_idx is not None and preferred_idx != idx:
+                    log("FILL", f"略過替代單選群組: {label} -> {matched_key}")
+                    continue
+
+        await fill_question(item, selections)
+
+        if answer:
+            filled_question_keys.add(dedupe_key)
+
+
+async def verify_question_state(item: dict[str, object], selections: dict[str, str]) -> str | None:
+    label = str(item.get("label", "")).strip()
+    answer = get_answer_for_label(selections, label).strip()
+    if not answer:
+        return None
+
+    question = item["question"]
+    question_type = str(item.get("type", "")).strip()
+
+    if question_type == "radio":
+        actual_answer = resolve_actual_answer(item, answer)
+        option = question.locator(f'div[role="radio"][data-value="{actual_answer}"]').first
+        if await option.count() == 0:
+            return f"{label}: 找不到應選單選值 {actual_answer}"
+        checked = await option.get_attribute("aria-checked")
+        if checked != "true":
+            return f"{label}: 單選目前未選中 {actual_answer}"
+        return None
+
+    if question_type == "checkbox":
+        targets = [x.strip() for x in answer.split(",") if x.strip()]
+        for target in targets:
+            option = question.locator(f'div[role="checkbox"][data-value="{target}"]').first
+            if await option.count() == 0:
+                return f"{label}: 找不到應選複選值 {target}"
+            checked = await option.get_attribute("aria-checked")
+            if checked != "true":
+                return f"{label}: 複選目前未勾選 {target}"
+        return None
+
+    if question_type == "dropdown":
+        dropdown = question.locator('div[role="listbox"]').first
+        if await dropdown.count() == 0:
+            return f"{label}: 找不到下拉欄"
+        current = normalize_label((await dropdown.inner_text()).strip())
+        if answer not in current:
+            return f"{label}: 下拉目前值不是 {answer}"
+        return None
+
+    return None
+
+
+async def verify_current_page_answers(inspected: list[dict[str, object]], selections: dict[str, str]) -> list[str]:
+    mismatches: list[str] = []
+    preferred_radio_indices = build_preferred_radio_indices(inspected, selections)
+    seen_keys: set[tuple[str, str, str]] = set()
+
+    for idx, item in enumerate(inspected):
+        label = str(item.get("label", "")).strip()
+        question_type = str(item.get("type", "")).strip()
+        matched_key = resolve_selection_key(selections, label) or label
+        answer = get_answer_for_label(selections, label).strip()
+        dedupe_key = (matched_key, question_type, answer)
+
+        if answer and dedupe_key in seen_keys:
+            continue
+
+        if answer and question_type == "radio":
+            preferred_idx = preferred_radio_indices.get(dedupe_key)
+            if preferred_idx is not None and preferred_idx != idx:
+                continue
+
+        mismatch = await verify_question_state(item, selections)
+        if mismatch:
+            mismatches.append(mismatch)
+
+        if answer:
+            seen_keys.add(dedupe_key)
+
+    return mismatches
+
+
 async def goto_form_and_wait_login(page: Page) -> None:
     log("NAV", f"前往表單: {FORM_URL}")
     await page.goto(FORM_URL, wait_until="domcontentloaded")
@@ -773,6 +959,7 @@ async def fill_one_form(page: Page, selections: dict) -> str:
     previous_signature = ""
     stagnant_rounds = 0
     empty_rounds = 0
+    no_button_rounds = 0
     while True:
         log("LOOP", f"進入第 {round_idx} 輪")
         inspected, page_snapshot = await inspect_current_page(page)
@@ -804,8 +991,33 @@ async def fill_one_form(page: Page, selections: dict) -> str:
             for label in added:
                 log("SYNC", f"未映射欄位: {label}")
 
-        for item in inspected:
-            await fill_question(item, selections)
+        await fill_questions_for_current_page(inspected, selections)
+
+        mismatches = await verify_current_page_answers(inspected, selections)
+        if mismatches:
+            log("VERIFY", "送出前檢查發現選項狀態不一致，嘗試重新填寫")
+            for mismatch in mismatches:
+                log("VERIFY", mismatch)
+
+            await fill_questions_for_current_page(inspected, selections)
+
+            mismatches = await verify_current_page_answers(inspected, selections)
+            if mismatches:
+                log("VERIFY", "重新填寫後仍有未正確選取的欄位，暫停流程")
+                for mismatch in mismatches:
+                    log("VERIFY", mismatch)
+                if PAUSE_ON_STALL:
+                    user_choice = await asyncio.to_thread(
+                        input,
+                        "送出前檢查失敗。按 Enter 重試、輸入 q 結束: ",
+                    )
+                    if user_choice.strip().lower() == "q":
+                        log("DONE", "使用者選擇結束")
+                        return "aborted"
+                    log("DONE", "使用者選擇重試")
+                    round_idx += 1
+                    continue
+                return "aborted"
 
         action = await click_next_or_submit(page, selections)
         if action == "aborted":
@@ -824,6 +1036,17 @@ async def fill_one_form(page: Page, selections: dict) -> str:
             log("DONE", "表單已送出")
             return "submitted"
         if action == "none":
+            no_button_rounds += 1
+            if no_button_rounds <= 3:
+                log("WAIT", f"尚未偵測到下一步/提交按鈕,自動等待後重試 ({no_button_rounds}/3)")
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=2500)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+                round_idx += 1
+                continue
+
             log("DONE", "未找到下一步或提交按鈕(表單可能需要手動填寫或已到達新頁面)")
             if PAUSE_ON_STALL:
                 user_choice = await asyncio.to_thread(
@@ -838,6 +1061,8 @@ async def fill_one_form(page: Page, selections: dict) -> str:
                 continue
             log("DONE", "PAUSE_ON_STALL=False,流程自動結束")
             return "aborted"
+        else:
+            no_button_rounds = 0
 
         if stagnant_rounds >= 3:
             missing_labels: list[str] = []
