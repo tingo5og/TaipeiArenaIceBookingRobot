@@ -29,8 +29,43 @@ COURSE_TIME_KEY = "課程時間"
 COURSE_TIME_LABELS = ["滑冰基礎班", "花式初級班", "花式進階班", "冰球初級班", "冰球進階班"]
 
 
+def configure_stdio_utf8() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+configure_stdio_utf8()
+
+
+def safe_print(message: str) -> None:
+    try:
+        print(message)
+        return
+    except UnicodeEncodeError:
+        pass
+
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    encoded = message.encode(encoding, errors="replace")
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(encoded + b"\n")
+        buffer.flush()
+        return
+
+    sys.stdout.write(encoded.decode(encoding, errors="replace") + "\n")
+    sys.stdout.flush()
+
+
 def log(step: str, message: str) -> None:
-    print(f"[{step}] {message}")
+    safe_print(f"[{step}] {message}")
 
 
 def cleanup_profile_lock_files(profile_dir: Path) -> None:

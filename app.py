@@ -49,6 +49,10 @@ PLAYWRIGHT_BROWSERS_DIR = BASE_DIR / "ms-playwright"
 GOOGLE_PROFILE_DIR = BASE_DIR / "google_profile"
 BOOKING_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSchP7dRjEOyofx3V6cu7do8UM_WghZRuB9QnwMwQAvceZ2evg/viewform?pli=1&pli=1"
 
+# 統一 Python 子程序輸出編碼，降低 Windows 碼頁造成的亂碼風險。
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 if IS_FROZEN:
     # EXE 模式固定瀏覽器下載位置，避免指向 _internal/.local-browsers 後找不到檔案。
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
@@ -70,7 +74,7 @@ def _run_python_module(args: list[str]) -> tuple[bool, str]:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
-                errors="ignore",
+                errors="replace",
                 check=False,
             )
         except Exception as exc:
@@ -106,7 +110,7 @@ def _run_playwright_install_chromium() -> tuple[bool, str]:
             capture_output=True,
             text=True,
             encoding="utf-8",
-            errors="ignore",
+            errors="replace",
             check=False,
         )
     except Exception as exc:
@@ -150,6 +154,58 @@ def _resolve_chromium_executable() -> tuple[Path | None, str]:
     if not chromium_path.exists():
         return None, f"找不到 Chromium 執行檔: {chromium_path}"
     return chromium_path, ""
+
+
+def decode_process_output(data: bytes) -> str:
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return data.decode(errors="replace")
+
+
+def force_close_profile_browsers(profile_dir: Path) -> tuple[bool, str]:
+    """強制關閉使用指定 user-data-dir 的瀏覽器程序。"""
+    profile_path = str(profile_dir.resolve()).replace("'", "''")
+    ps_script = f"""
+$target = [System.IO.Path]::GetFullPath('{profile_path}').ToLowerInvariant()
+$targets = @("chrome.exe", "msedge.exe", "chromium.exe")
+$killed = @()
+
+Get-CimInstance Win32_Process | Where-Object {{
+    $_.Name -and $targets -contains $_.Name.ToLowerInvariant() -and $_.CommandLine -and $_.CommandLine.ToLowerInvariant().Contains("--user-data-dir=" + $target)
+}} | ForEach-Object {{
+    try {{
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+        $killed += $_.ProcessId
+    }} catch {{
+    }}
+}}
+
+if ($killed.Count -gt 0) {{
+    Write-Output ("KILLED=" + (($killed | Sort-Object -Unique) -join ","))
+}} else {{
+    Write-Output "KILLED="
+}}
+"""
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except Exception as exc:
+        return False, str(exc)
+
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode != 0:
+        return False, output or f"PowerShell 結束碼: {result.returncode}"
+
+    return True, output
 
 
 def ensure_runtime_dependencies() -> bool:
@@ -578,6 +634,8 @@ class CourseTab(QWidget):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("BOOKING_BASE_DIR", str(BASE_DIR))
         env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
         process.setProcessEnvironment(env)
         process.setProcessChannelMode(QProcess.MergedChannels)
         process.readyReadStandardOutput.connect(self.on_load_from_web_output)
@@ -592,14 +650,14 @@ class CourseTab(QWidget):
         if self.load_process is None:
             return
         data = self.load_process.readAllStandardOutput().data()
-        text = data.decode(errors="ignore")
+        text = decode_process_output(data)
         if text:
             self.load_output_chunks.append(text)
 
     def on_load_from_web_finished(self, exit_code: int, _status) -> None:
         if self.load_process is not None:
             data = self.load_process.readAllStandardOutput().data()
-            text = data.decode(errors="ignore")
+            text = decode_process_output(data)
             if text:
                 self.load_output_chunks.append(text)
 
@@ -892,12 +950,24 @@ class RunTab(QWidget):
 
         self.build_execution_list()
 
+        ok, detail = force_close_profile_browsers(GOOGLE_PROFILE_DIR)
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "提醒",
+                "無法預先關閉占用主 profile 的瀏覽器程序，仍嘗試啟動 do_table。\n\n"
+                f"詳細資訊:\n{detail}",
+            )
+        elif detail:
+            self.append_log(f"[PROFILE] 已嘗試釋放主 profile: {detail}")
+
         self.run_script(
             DO_TABLE_SCRIPT,
             {
                 "BOOKING_CONFIRM_MODE": self._current_confirm_mode(),
                 "BOOKING_SUBMIT_DELAY_RANGE": self._current_delay_mode(),
                 "BOOKING_ANTIBOT_JITTER": "1" if self.antibot_jitter_checkbox.isChecked() else "0",
+                "BOOKING_PROFILE_STRATEGY": "primary_only",
             },
         )
 
@@ -906,6 +976,15 @@ class RunTab(QWidget):
         if chromium_path is None:
             QMessageBox.critical(self, "開啟失敗", f"無法取得 Chromium。\n\n{detail}")
             return
+
+        ok, close_detail = force_close_profile_browsers(GOOGLE_PROFILE_DIR)
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "提醒",
+                "無法預先關閉占用主 profile 的瀏覽器程序，仍嘗試開啟網頁。\n\n"
+                f"詳細資訊:\n{close_detail}",
+            )
 
         try:
             GOOGLE_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -942,6 +1021,8 @@ class RunTab(QWidget):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("BOOKING_BASE_DIR", str(BASE_DIR))
         env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
         if extra_env:
             for key, value in extra_env.items():
                 env.insert(str(key), str(value))
@@ -966,7 +1047,7 @@ class RunTab(QWidget):
         if self.process is None:
             return
         data = self.process.readAllStandardOutput().data()
-        text = data.decode(errors="ignore")
+        text = decode_process_output(data)
         self.append_log(text)
 
         for line in text.splitlines():

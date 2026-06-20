@@ -53,11 +53,47 @@ ANTIBOT_JITTER_ENABLED = os.environ.get("BOOKING_ANTIBOT_JITTER", "0").strip() =
 VERIFY_POLL_INTERVAL_SEC = float(os.environ.get("BOOKING_VERIFY_POLL_INTERVAL_SEC", "1.2"))
 VERIFY_CLEAR_STABLE_ROUNDS = int(os.environ.get("BOOKING_VERIFY_CLEAR_STABLE_ROUNDS", "2"))
 VERIFY_MAX_WAIT_SEC = int(os.environ.get("BOOKING_VERIFY_MAX_WAIT_SEC", "0"))
+PROFILE_STRATEGY = os.environ.get("BOOKING_PROFILE_STRATEGY", "auto").strip().lower()
+
+
+def configure_stdio_utf8() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+configure_stdio_utf8()
+
+
+def safe_print(message: str) -> None:
+    try:
+        print(message)
+        return
+    except UnicodeEncodeError:
+        pass
+
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    encoded = message.encode(encoding, errors="replace")
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(encoded + b"\n")
+        buffer.flush()
+        return
+
+    sys.stdout.write(encoded.decode(encoding, errors="replace") + "\n")
+    sys.stdout.flush()
 
 
 def log(step: str, message: str) -> None:
     ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] [{step}] {message}")
+    safe_print(f"[{ts}] [{step}] {message}")
 
 
 def cleanup_profile_lock_files(profile_dir: Path) -> None:
@@ -104,6 +140,8 @@ async def launch_persistent_context_with_fallback(playwright_instance):
         return context
     except Exception as exc:
         log("WARN", f"主 profile 啟動失敗: {exc}")
+        if PROFILE_STRATEGY == "primary_only":
+            raise RuntimeError("主 profile 啟動失敗，且目前為 primary_only 模式") from exc
         log("WARN", "可能是 profile 正被其他瀏覽器使用或發生鎖檔衝突，改用備援 profile")
 
     fallback_dir.mkdir(parents=True, exist_ok=True)
@@ -1214,7 +1252,7 @@ async def main() -> None:
         log("EXIT", "使用者中斷執行")
     except Exception as exc:
         log("FATAL", f"未處理例外: {exc}")
-        print(traceback.format_exc())
+        safe_print(traceback.format_exc())
 
 
 if __name__ == "__main__":
