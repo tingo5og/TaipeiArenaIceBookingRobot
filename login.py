@@ -21,11 +21,72 @@ BASE_DIR = get_base_dir()
 
 # 設定資料儲存路徑 (路徑可自訂)
 USER_DATA_DIR = str(BASE_DIR / "google_profile")
+FALLBACK_USER_DATA_DIR = str(BASE_DIR / "google_profile_playwright")
 google_form_url = "https://docs.google.com/forms/d/e/1FAIpQLSchP7dRjEOyofx3V6cu7do8UM_WghZRuB9QnwMwQAvceZ2evg/viewform?pli=1&pli=1"
 QUESTIONS_SNAPSHOT_FILE = BASE_DIR / "questions_snapshot.json"
 COURSE_CSV_FILE = BASE_DIR / "courses_schedule.csv"
 COURSE_TIME_KEY = "課程時間"
 COURSE_TIME_LABELS = ["滑冰基礎班", "花式初級班", "花式進階班", "冰球初級班", "冰球進階班"]
+
+
+def log(step: str, message: str) -> None:
+    print(f"[{step}] {message}")
+
+
+def cleanup_profile_lock_files(profile_dir: Path) -> None:
+    lock_paths = [
+        profile_dir / "SingletonLock",
+        profile_dir / "SingletonCookie",
+        profile_dir / "SingletonSocket",
+        profile_dir / "lockfile",
+        profile_dir / "Default" / "LOCK",
+    ]
+    removed: list[str] = []
+
+    for lock_path in lock_paths:
+        try:
+            if lock_path.exists():
+                lock_path.unlink()
+                removed.append(str(lock_path.relative_to(profile_dir)))
+        except Exception as exc:
+            log("WARN", f"無法移除 lock 檔 {lock_path.name}: {exc}")
+
+    if removed:
+        log("BROWSER", f"已清理 lock 檔: {', '.join(removed)}")
+
+
+async def launch_persistent_context_with_fallback(playwright_instance):
+    launch_kwargs = {
+        "headless": False,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+
+    primary_dir = Path(USER_DATA_DIR)
+    fallback_dir = Path(FALLBACK_USER_DATA_DIR)
+
+    primary_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_profile_lock_files(primary_dir)
+
+    try:
+        context = await playwright_instance.chromium.launch_persistent_context(
+            str(primary_dir),
+            **launch_kwargs,
+        )
+        log("BROWSER", f"使用主 profile 啟動: {primary_dir}")
+        return context
+    except Exception as exc:
+        log("WARN", f"主 profile 啟動失敗: {exc}")
+        log("WARN", "改用備援 profile 繼續")
+
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_profile_lock_files(fallback_dir)
+
+    context = await playwright_instance.chromium.launch_persistent_context(
+        str(fallback_dir),
+        **launch_kwargs,
+    )
+    log("BROWSER", f"使用備援 profile 啟動: {fallback_dir}")
+    return context
 
 
 def normalize_label(raw_text: str) -> str:
@@ -238,18 +299,18 @@ async def detect_email_field_label(page) -> tuple[str | None, list[str]]:
 
 async def init_browser(auto_close: bool = False):
     async with async_playwright() as p:
-        # 開啟持久化上下文
-        context = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=False, # 必須為 False 才能手動登入
-            args=["--disable-blink-features=AutomationControlled"] # 隱藏自動化特徵，減少驗證碼
-        )
+        # 開啟持久化上下文（主 profile 失敗時自動切備援）
+        context = await launch_persistent_context_with_fallback(p)
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(google_form_url, wait_until="domcontentloaded")
 
         if "accounts.google.com" in page.url:
-            print("請先在瀏覽器完成 Google 登入，完成後按 Enter。")
-            await asyncio.to_thread(input, "登入完成後按 Enter 繼續... ")
+            print("請先在瀏覽器完成 Google 登入。")
+            if auto_close:
+                print("偵測到 GUI 自動模式，將自動等待登入完成（最多 180 秒）。")
+                await page.wait_for_url("**docs.google.com/forms/**", timeout=180000)
+            else:
+                await asyncio.to_thread(input, "登入完成後按 Enter 繼續... ")
             await page.goto(google_form_url, wait_until="domcontentloaded")
 
         await page.wait_for_load_state("networkidle")

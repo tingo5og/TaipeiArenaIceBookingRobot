@@ -23,6 +23,7 @@ def get_base_dir() -> Path:
 BASE_DIR = get_base_dir()
 
 USER_DATA_DIR = str(BASE_DIR / "google_profile")
+FALLBACK_USER_DATA_DIR = str(BASE_DIR / "google_profile_playwright")
 FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSchP7dRjEOyofx3V6cu7do8UM_WghZRuB9QnwMwQAvceZ2evg/viewform?pli=1&pli=1"
 SELECTIONS_FILE = BASE_DIR / "selections.json"
 QUESTIONS_SNAPSHOT_FILE = BASE_DIR / "questions_snapshot.json"
@@ -57,6 +58,63 @@ VERIFY_MAX_WAIT_SEC = int(os.environ.get("BOOKING_VERIFY_MAX_WAIT_SEC", "0"))
 def log(step: str, message: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [{step}] {message}")
+
+
+def cleanup_profile_lock_files(profile_dir: Path) -> None:
+    lock_paths = [
+        profile_dir / "SingletonLock",
+        profile_dir / "SingletonCookie",
+        profile_dir / "SingletonSocket",
+        profile_dir / "lockfile",
+        profile_dir / "Default" / "LOCK",
+    ]
+    removed: list[str] = []
+
+    for lock_path in lock_paths:
+        try:
+            if lock_path.exists():
+                lock_path.unlink()
+                removed.append(str(lock_path.relative_to(profile_dir)))
+        except Exception as exc:
+            log("WARN", f"無法移除 lock 檔 {lock_path.name}: {exc}")
+
+    if removed:
+        log("BROWSER", f"已清理 lock 檔: {', '.join(removed)}")
+
+
+async def launch_persistent_context_with_fallback(playwright_instance):
+    launch_kwargs = {
+        "headless": False,
+        "slow_mo": 300,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+
+    primary_dir = Path(USER_DATA_DIR)
+    fallback_dir = Path(FALLBACK_USER_DATA_DIR)
+
+    primary_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_profile_lock_files(primary_dir)
+
+    try:
+        context = await playwright_instance.chromium.launch_persistent_context(
+            str(primary_dir),
+            **launch_kwargs,
+        )
+        log("BROWSER", f"使用主 profile 啟動: {primary_dir}")
+        return context
+    except Exception as exc:
+        log("WARN", f"主 profile 啟動失敗: {exc}")
+        log("WARN", "可能是 profile 正被其他瀏覽器使用或發生鎖檔衝突，改用備援 profile")
+
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_profile_lock_files(fallback_dir)
+
+    context = await playwright_instance.chromium.launch_persistent_context(
+        str(fallback_dir),
+        **launch_kwargs,
+    )
+    log("BROWSER", f"使用備援 profile 啟動: {fallback_dir}")
+    return context
 
 
 def get_submit_delay_seconds() -> float:
@@ -1115,12 +1173,7 @@ async def run_filler() -> None:
             row_nums = [None]
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=False,
-            slow_mo=300,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        context = await launch_persistent_context_with_fallback(p)
         page = context.pages[0] if context.pages else await context.new_page()
         await goto_form_and_wait_login(page)
 
