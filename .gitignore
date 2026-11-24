@@ -16,10 +16,15 @@ env/
 .DS_Store
 Thumbs.db
 
-# Playwright persistent profile (contains login/session)
+# Browser profiles (contain login/session)
+browser_profile/
+browser_profile_fallback/
+# Legacy profile folders from the Google Form version
 google_profile/
+google_profile_playwright/
 
-# Generated data files
-questions_snapshot.json
+# Temporary files
+*.csv.tmp
 
-# Local runtime data (usually personal/sensitive)
+# Local runtime data (personal booking status)
+courses_schedule.csv
